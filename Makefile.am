@@ -108,14 +108,12 @@ janus_CFLAGS = \
 	$(JANUS_CFLAGS) \
 	-DPLUGINDIR=\"$(plugindir)\" \
 	-DCONFDIR=\"$(confdir)\" \
-	$(BORINGSSL_CFLAGS) \
 	$(NULL)
 
 janus_LDADD = \
-	$(BORINGSSL_LIBS) \
 	$(JANUS_LIBS) \
 	$(JANUS_MANUAL_LIBS) \
-	-lsrtp \
+	-lsrtp -lsqlite3\
 	$(NULL)
 
 BUILT_SOURCES = cmdline.c cmdline.h
@@ -137,6 +135,7 @@ plugins_cflags = \
 
 plugins_libadd = \
 	$(PLUGINS_LIBS) \
+	-lsqlite3 -lavformat -lavcodec -lavutil -lm\
 	$(NULL)
 
 if ENABLE_PLUGIN_AUDIOBRIDGE
@@ -244,7 +243,6 @@ bin_PROGRAMS += janus-pp-rec
 janus_pp_rec_SOURCES = \
 	postprocessing/pp-opus.c \
 	postprocessing/pp-opus.h \
-	postprocessing/pp-opus-silence.h \
 	postprocessing/pp-rtp.h \
 	postprocessing/pp-webm.c \
 	postprocessing/pp-webm.h \
@@ -258,6 +256,7 @@ janus_pp_rec_CFLAGS = \
 
 janus_pp_rec_LDADD = \
 	$(POST_PROCESSING_LIBS) \
+	-lsqlite3 -lavformat -lavcodec -lavutil -lm \
 	$(NULL)
 endif
 
