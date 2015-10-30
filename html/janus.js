@@ -1035,7 +1035,8 @@ function Janus(gatewayCallbacks) {
 		}
 		Janus.log("Preparing local SDP and gathering candidates (trickle=" + config.trickle + ")"); 
 		config.pc.onicecandidate = function(event) {
-			if (event.candidate == null) {
+			if (event.candidate == null ||
+					(webrtcDetectedBrowser === 'edge' && event.candidate.candidate.indexOf('endOfCandidates') > 0)) {
 				Janus.log("End of candidates.");
 				config.iceDone = true;
 				if(config.trickle === true) {
@@ -1447,7 +1448,7 @@ function Janus(gatewayCallbacks) {
 		Janus.log("Creating offer (iceDone=" + config.iceDone + ")");
 		// https://code.google.com/p/webrtc/issues/detail?id=3508
 		var mediaConstraints = null;
-		if(webrtcDetectedBrowser == "firefox") {
+		if(webrtcDetectedBrowser == "firefox" || webrtcDetectedBrowser == "edge") {
 			mediaConstraints = {
 				'offerToReceiveAudio':isAudioRecvEnabled(media), 
 				'offerToReceiveVideo':isVideoRecvEnabled(media)
@@ -1505,7 +1506,7 @@ function Janus(gatewayCallbacks) {
 		var config = pluginHandle.webrtcStuff;
 		Janus.log("Creating answer (iceDone=" + config.iceDone + ")");
 		var mediaConstraints = null;
-		if(webrtcDetectedBrowser == "firefox") {
+		if(webrtcDetectedBrowser == "firefox" || webrtcDetectedBrowser == "edge") {
 			mediaConstraints = {
 				'offerToReceiveAudio':isAudioRecvEnabled(media), 
 				'offerToReceiveVideo':isVideoRecvEnabled(media)
@@ -1735,12 +1736,28 @@ function Janus(gatewayCallbacks) {
 			config.bitrate.tsbefore = null;
 			config.bitrate.value = null;
 			try {
+				// Try a MediaStream.stop() first
 				if(!config.streamExternal && config.myStream !== null && config.myStream !== undefined) {
 					Janus.log("Stopping local stream");
 					config.myStream.stop();
 				}
 			} catch(e) {
-				// Do nothing
+				// Do nothing if this fails
+			}
+			try {
+				// Try a MediaStreamTrack.stop() for each track as well
+				if(!config.streamExternal && config.myStream !== null && config.myStream !== undefined) {
+					Janus.log("Stopping local stream tracks");
+					var tracks = config.myStream.getTracks();
+					for(var i in tracks) {
+						var mst = tracks[i];
+						Janus.log(mst);
+						if(mst !== null && mst !== undefined)
+							mst.stop();
+					}
+				}
+			} catch(e) {
+				// Do nothing if this fails
 			}
 			config.streamExternal = false;
 			config.myStream = null;
@@ -1785,6 +1802,10 @@ function Janus(gatewayCallbacks) {
 
 	function isVideoSendEnabled(media) {
 		Janus.debug("isVideoSendEnabled:", media);
+		if(webrtcDetectedBrowser == "edge") {
+			Janus.warn("Edge doesn't support compatible video yet");
+			return false;
+		}
 		if(media === undefined || media === null)
 			return true;	// Default
 		if(media.video === false)
@@ -1796,6 +1817,10 @@ function Janus(gatewayCallbacks) {
 
 	function isVideoRecvEnabled(media) {
 		Janus.debug("isVideoRecvEnabled:", media);
+		if(webrtcDetectedBrowser == "edge") {
+			Janus.warn("Edge doesn't support compatible video yet");
+			return false;
+		}
 		if(media === undefined || media === null)
 			return true;	// Default
 		if(media.video === false)
@@ -1807,6 +1832,10 @@ function Janus(gatewayCallbacks) {
 
 	function isDataEnabled(media) {
 		Janus.debug("isDataEnabled:", media);
+		if(webrtcDetectedBrowser == "edge") {
+			Janus.warn("Edge doesn't support data channels yet");
+			return false;
+		}
 		if(media === undefined || media === null)
 			return false;	// Default
 		return (media.data === true);

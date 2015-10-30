@@ -1067,14 +1067,6 @@ void janus_ice_webrtc_free(janus_ice_handle *handle) {
 		}
 	}
 	handle->pending_trickles = NULL;
-	if(handle->remote_hashing != NULL) {
-		g_free(handle->remote_hashing);
-		handle->remote_hashing = NULL;
-	}
-	if(handle->remote_fingerprint != NULL) {
-		g_free(handle->remote_fingerprint);
-		handle->remote_fingerprint = NULL;
-	}
 	if(handle->local_sdp != NULL) {
 		g_free(handle->local_sdp);
 		handle->local_sdp = NULL;
@@ -1119,7 +1111,7 @@ void janus_ice_stream_free(GHashTable *streams, janus_ice_stream *stream) {
 	if(stream == NULL)
 		return;
 	if(streams != NULL)
-		g_hash_table_remove(streams, stream);
+		g_hash_table_remove(streams, GUINT_TO_POINTER(stream->stream_id));
 	if(stream->components != NULL) {
 		janus_ice_component_free(stream->components, stream->rtp_component);
 		stream->rtp_component = NULL;
@@ -1128,6 +1120,14 @@ void janus_ice_stream_free(GHashTable *streams, janus_ice_stream *stream) {
 		g_hash_table_destroy(stream->components);
 	}
 	stream->handle = NULL;
+	if(stream->remote_hashing != NULL) {
+		g_free(stream->remote_hashing);
+		stream->remote_hashing = NULL;
+	}
+	if(stream->remote_fingerprint != NULL) {
+		g_free(stream->remote_fingerprint);
+		stream->remote_fingerprint = NULL;
+	}
 	if(stream->ruser != NULL) {
 		g_free(stream->ruser);
 		stream->ruser = NULL;
@@ -1151,7 +1151,7 @@ void janus_ice_component_free(GHashTable *components, janus_ice_component *compo
 		return;
 	//~ janus_mutex_lock(&handle->mutex);
 	if(components != NULL)
-		g_hash_table_remove(components, component);
+		g_hash_table_remove(components, GUINT_TO_POINTER(component->component_id));
 	component->stream = NULL;
 	if(component->source != NULL) {
 		g_source_destroy(component->source);
@@ -1416,6 +1416,154 @@ void janus_ice_cb_new_selected_pair (NiceAgent *agent, guint stream_id, guint co
 	g_source_set_callback(component->source, janus_dtls_retry, component->dtls, NULL);
 	guint id = g_source_attach(component->source, handle->icectx);
 	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Creating retransmission timer with ID %u\n", handle->handle_id, id);
+}
+
+#ifndef HAVE_LIBNICE_TCP
+void janus_ice_cb_new_remote_candidate (NiceAgent *agent, guint stream_id, guint component_id, gchar *foundation, gpointer ice) {
+#else
+void janus_ice_cb_new_remote_candidate (NiceAgent *agent, NiceCandidate *candidate, gpointer ice) {
+#endif
+	janus_ice_handle *handle = (janus_ice_handle *)ice;
+#ifndef HAVE_LIBNICE_TCP
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Discovered new remote candidate for component %d in stream %d: foundation=%s\n", handle ? handle->handle_id : 0, component_id, stream_id, foundation);
+#else
+	const char *ctype = NULL;
+	switch(candidate->type) {
+		case NICE_CANDIDATE_TYPE_HOST:
+			ctype = "host";
+			break;
+		case NICE_CANDIDATE_TYPE_SERVER_REFLEXIVE:
+			ctype = "srflx";
+			break;
+		case NICE_CANDIDATE_TYPE_PEER_REFLEXIVE:
+			ctype = "prflx";
+			break;
+		case NICE_CANDIDATE_TYPE_RELAYED:
+			ctype = "relay";
+			break;
+		default:
+			break;
+	}
+	guint stream_id = candidate->stream_id;
+	guint component_id = candidate->component_id;
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Discovered new remote candidate for component %d in stream %d: type=%s\n", handle ? handle->handle_id : 0, component_id, stream_id, ctype);
+#endif
+	if(!handle)
+		return;
+	janus_ice_stream *stream = g_hash_table_lookup(handle->streams, GUINT_TO_POINTER(stream_id));
+	if(!stream) {
+		JANUS_LOG(LOG_ERR, "[%"SCNu64"]     No stream %d??\n", handle->handle_id, stream_id);
+		return;
+	}
+	janus_ice_component *component = g_hash_table_lookup(stream->components, GUINT_TO_POINTER(component_id));
+	if(!component) {
+		JANUS_LOG(LOG_ERR, "[%"SCNu64"]     No component %d in stream %d??\n", handle->handle_id, component_id, stream_id);
+		return;
+	}
+#ifndef HAVE_LIBNICE_TCP
+	/* Get remote candidates and look for the related foundation */
+	NiceCandidate *candidate = NULL;
+	GSList *candidates = nice_agent_get_remote_candidates(agent, component_id, stream_id), *tmp = candidates;
+	while(tmp) {
+		NiceCandidate *c = (NiceCandidate *)tmp->data;
+		if(candidate == NULL) {
+			/* Check if this is what we're looking for */
+			if(!strcasecmp(c->foundation, foundation)) {
+				/* It is! */
+				candidate = c;
+				tmp = tmp->next;
+				continue;
+			}
+		}
+		nice_candidate_free(c);
+		tmp = tmp->next;
+	}
+	g_slist_free(candidates);
+	if(candidate == NULL) {
+		JANUS_LOG(LOG_WARN, "Candidate with foundation %s not found?\n", foundation);
+		return;
+	}
+#endif
+	/* Render the candidate and add it to the remote_candidates cache for the admin API */
+	if(candidate->type != NICE_CANDIDATE_TYPE_PEER_REFLEXIVE) {
+		/* ... but only if it's 'prflx', the others we add ourselves */
+		goto candidatedone;
+	}
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"] Stream #%d, Component #%d\n", handle->handle_id, candidate->stream_id, candidate->component_id);
+	gchar address[NICE_ADDRESS_STRING_LEN], base_address[NICE_ADDRESS_STRING_LEN];
+	gint port = 0, base_port = 0;
+	nice_address_to_string(&(candidate->addr), (gchar *)&address);
+	port = nice_address_get_port(&(candidate->addr));
+	nice_address_to_string(&(candidate->base_addr), (gchar *)&base_address);
+	base_port = nice_address_get_port(&(candidate->base_addr));
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Address:    %s:%d\n", handle->handle_id, address, port);
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Priority:   %d\n", handle->handle_id, candidate->priority);
+	JANUS_LOG(LOG_VERB, "[%"SCNu64"]   Foundation: %s\n", handle->handle_id, candidate->foundation);
+	char buffer[100];
+	if(candidate->transport == NICE_CANDIDATE_TRANSPORT_UDP) {
+		g_snprintf(buffer, 100,
+			"%s %d %s %d %s %d typ prflx raddr %s rport %d\r\n", 
+				candidate->foundation,
+				candidate->component_id,
+				"udp",
+				candidate->priority,
+				address,
+				port,
+				base_address,
+				base_port);
+	} else {
+		if(!janus_ice_tcp_enabled) {
+			/* ICETCP support disabled */
+			JANUS_LOG(LOG_WARN, "[%"SCNu64"] Skipping prflx TCP candidate, ICETCP support disabled...\n", handle->handle_id);
+			goto candidatedone;
+		}
+#ifndef HAVE_LIBNICE_TCP
+		/* TCP candidates are only supported since libnice 0.1.8 */
+		JANUS_LOG(LOG_WARN, "[%"SCNu64"] Skipping prflx TCP candidate, the libnice version doesn't support it...\n", handle->handle_id);
+			goto candidatedone;
+#else
+		const char *type = NULL;
+		switch(candidate->transport) {
+			case NICE_CANDIDATE_TRANSPORT_TCP_ACTIVE:
+				type = "active";
+				break;
+			case NICE_CANDIDATE_TRANSPORT_TCP_PASSIVE:
+				type = "passive";
+				break;
+			case NICE_CANDIDATE_TRANSPORT_TCP_SO:
+				type = "so";
+				break;
+			default:
+				break;
+		}
+		if(type == NULL) {
+			/* FIXME Unsupported transport */
+			JANUS_LOG(LOG_WARN, "[%"SCNu64"] Unsupported transport, skipping nonUDP/TCP prflx candidate...\n", handle->handle_id);
+			goto candidatedone;
+		} else {
+			g_snprintf(buffer, 100,
+				"%s %d %s %d %s %d typ prflx raddr %s rport %d tcptype %s\r\n",
+					candidate->foundation,
+					candidate->component_id,
+					"tcp",
+					candidate->priority,
+					address,
+					port,
+					base_address,
+					base_port,
+					type);
+		}
+#endif
+	}
+
+	/* Save for the summary, in case we need it */
+	component->remote_candidates = g_slist_append(component->remote_candidates, g_strdup(buffer));
+
+candidatedone:
+#ifndef HAVE_LIBNICE_TCP
+	nice_candidate_free(candidate);
+#endif
+	return;
 }
 
 void janus_ice_cb_nice_recv(NiceAgent *agent, guint stream_id, guint component_id, guint len, gchar *buf, gpointer ice) {
@@ -2239,6 +2387,12 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 	g_signal_connect (G_OBJECT (handle->agent), "new-selected-pair-full",
 #endif
 		G_CALLBACK (janus_ice_cb_new_selected_pair), handle);
+#ifndef HAVE_LIBNICE_TCP
+	g_signal_connect (G_OBJECT (handle->agent), "new-remote-candidate",
+#else
+	g_signal_connect (G_OBJECT (handle->agent), "new-remote-candidate-full",
+#endif
+		G_CALLBACK (janus_ice_cb_new_remote_candidate), handle);
 
 	/* Add all local addresses, except those in the ignore list */
 	struct ifaddrs *ifaddr, *ifa;
@@ -2364,6 +2518,8 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 			return -1;
 		}
 		audio_rtp->stream = audio_stream;
+		audio_rtp->stream_id = audio_stream->stream_id;
+		audio_rtp->component_id = 1;
 		audio_rtp->candidates = NULL;
 		audio_rtp->local_candidates = NULL;
 		audio_rtp->remote_candidates = NULL;
@@ -2427,6 +2583,8 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 #endif
 			}
 			audio_rtcp->stream = audio_stream;
+			audio_rtcp->stream_id = audio_stream->stream_id;
+			audio_rtcp->component_id = 2;
 			audio_rtcp->candidates = NULL;
 			audio_rtcp->local_candidates = NULL;
 			audio_rtcp->remote_candidates = NULL;
@@ -2480,12 +2638,6 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 		video_stream->components = g_hash_table_new(NULL, NULL);
 		janus_mutex_init(&video_stream->mutex);
 		g_hash_table_insert(handle->streams, GUINT_TO_POINTER(handle->video_id), video_stream);
-		handle->video_stream = video_stream;
-		janus_ice_component *video_rtp = (janus_ice_component *)g_malloc0(sizeof(janus_ice_component));
-		if(video_rtp == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			return -1;
-		}
 		if(!have_turnrest_credentials) {
 			/* No TURN REST API server and credentials, any static ones? */
 			if(janus_turn_server != NULL) {
@@ -2515,7 +2667,15 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 			}
 #endif
 		}
+		handle->video_stream = video_stream;
+		janus_ice_component *video_rtp = (janus_ice_component *)g_malloc0(sizeof(janus_ice_component));
+		if(video_rtp == NULL) {
+			JANUS_LOG(LOG_FATAL, "Memory error!\n");
+			return -1;
+		}
 		video_rtp->stream = video_stream;
+		video_rtp->stream_id = video_stream->stream_id;
+		video_rtp->component_id = 1;
 		video_rtp->candidates = NULL;
 		video_rtp->local_candidates = NULL;
 		video_rtp->remote_candidates = NULL;
@@ -2579,6 +2739,8 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 #endif
 			}
 			video_rtcp->stream = video_stream;
+			video_rtcp->stream_id = video_stream->stream_id;
+			video_rtcp->component_id = 2;
 			video_rtcp->candidates = NULL;
 			video_rtcp->local_candidates = NULL;
 			video_rtcp->remote_candidates = NULL;
@@ -2667,6 +2829,8 @@ int janus_ice_setup_local(janus_ice_handle *handle, int offer, int audio, int vi
 			return -1;
 		}
 		data_component->stream = data_stream;
+		data_component->stream_id = data_component->stream_id;
+		data_component->component_id = 1;
 		data_component->candidates = NULL;
 		data_component->local_candidates = NULL;
 		data_component->remote_candidates = NULL;
