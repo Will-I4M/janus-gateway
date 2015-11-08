@@ -500,7 +500,9 @@ typedef struct janus_videoroom_rtp_relay_packet {
  void janus_videoroom_create_db(void) ; 
  static int sql_callback(void *NotUsed, int argc, char **argv, char **azColName) ; 
  void janus_videoroom_insert_mediadb( uint32_t room_id,uint32_t user_id,char * filename, int media_type) ; 
- 
+ void janus_videoroom_insert_timecodedb(char * filename, char * ts) ; 
+ void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos) ; 
+
  
  static int sql_callback(void *NotUsed, int argc, char **argv, char **azColName)
  {
@@ -605,9 +607,7 @@ void janus_videoroom_insert_timecodedb(char * filename, char * ts)
  	sqlite3 *db ;
  	char *zErrMsg = 0 ;
  	char szsql[512] ;
- 	int j = 0, i = 0 ; 
- 	
- 	
+ 	 	
  	int rc ;
  	rc = sqlite3_open("media.db", &db) ;
  	sprintf(szsql, "INSERT INTO timecodes (filename,start_ts) VALUES ('%s','%s') ;",filename,ts) ; 
@@ -1989,7 +1989,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 			}
 		}
 		janus_mutex_unlock(&participant->rtp_forwarders_mutex);
-		unsigned char * vp8_h = buf+19 ;
+		unsigned char * vp8_h = (unsigned char *)(buf+19) ;
 		int need_to_wait = 1 ; 		
 		if (participant->video_active)
 		{
@@ -2382,7 +2382,7 @@ void janus_videoroom_hangup_media(janus_plugin_session *handle) {
 	
 void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 {
-		uint8_t * buf_ptr = offset ; 
+		uint8_t * buf_ptr = (uint8_t *) offset ; 
 			
 		infos->key = 0 ; 
 		infos->xbit = 0 ; 
@@ -2445,7 +2445,7 @@ void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 				if(!pbit) 
 				{
 					/* Get resolution */
-					unsigned char *c = buf_ptr + 3;
+					unsigned char *c = (unsigned char * )(buf_ptr + 3) ;
 					/* vet via sync code */
 					if(c[0]!=0x9d||c[1]!=0x01||c[2]!=0x2a) 
 						JANUS_LOG(LOG_WARN, "First 3-bytes after header not what they're supposed to be?\n");
@@ -2462,7 +2462,7 @@ void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 			}
 		}
 		infos->len = len ; 
-		infos->offset = buf_ptr ;  
+		infos->offset = (char *) buf_ptr ;  
 }
 
 static void * janus_videoroom_postprocess(void * data)
@@ -2477,13 +2477,12 @@ static void * janus_videoroom_postprocess(void * data)
 	int cur_seq_number = 0 ; 
 	
 	int nb_search = 0, key_search = 0,reset_search_min_seq = 0, broken = 0 ; 
-	int bytes = 0, numBytes = 1024 * 768 * 3 ;	/* FIXME */
+	int numBytes = 1024 * 768 * 3 ;	/* FIXME */
 	uint8_t * received_frame = g_malloc0(numBytes) ;
 	janus_vp8_infos * infos = g_malloc0(sizeof(janus_vp8_infos)) ;
-	unsigned char * retFrame = g_malloc0(numBytes) ;
 	unsigned char * compFrame = g_malloc0(numBytes) ;
 	
-	JANUS_LOG(LOG_ERR, "[%d]	BEGIN POSTPROCESS !!! \n",userdata->participant->user_id) ;
+	JANUS_LOG(LOG_INFO, "[%"SCNu64"]	BEGIN POSTPROCESS !!! \n",userdata->participant->user_id) ;
 	
 	userdata->need_keyframe = 0 ; 
 	
@@ -2496,12 +2495,12 @@ static void * janus_videoroom_postprocess(void * data)
 	int complete_frame = 0 ; 
 	int reinit_decoder = 1 ; 
 	
-	AVFrame * m_pFrame, * o_pFrame ; 
+	AVFrame * m_pFrame = NULL, * sws_frame = NULL ; 
 	av_register_all() ;
 	avcodec_register_all() ;
 	avformat_network_init() ; 
 	
-	AVCodecContext * m_pCodecCtx , *enc_ctx ;
+	AVCodecContext * m_pCodecCtx = NULL ;
 	AVCodec * m_pCodec ;
 	AVCodec * o_pCodec  =  avcodec_find_encoder(AV_CODEC_ID_VP8) ;
 	AVStream *vStream ;
@@ -2523,42 +2522,41 @@ static void * janus_videoroom_postprocess(void * data)
 	vStream->codec->codec_id = AV_CODEC_ID_VP8;
 	vStream->codec->codec_type = AVMEDIA_TYPE_VIDEO;
 	vStream->codec->time_base = (AVRational){1, 30};
-	vStream->codec->width = 640 ;
-	vStream->codec->height = 480 ;
+	vStream->codec->width = 800 ;
+	vStream->codec->height = 600 ;
 	vStream->codec->pix_fmt = AV_PIX_FMT_YUV420P;
-	vStream->codec->bit_rate = 128000 ; 
+	vStream->codec->bit_rate = 256000 ; 
 	vStream->codec->slices       = 8;
-	vStream->codec->profile      = 3 ;
+	//vStream->codec->profile      = 3 ;
 	vStream->codec->thread_count = 3 ;
 	vStream->codec->keyint_min   = 100 ;
-	vStream->codec->rc_min_rate = 96000 ; 
-	vStream->codec->rc_max_rate = 192000 ; 
-	vStream->codec->qmin = 4 ;
-	vStream->codec->qmax = 56;
+	vStream->codec->rc_min_rate = 128000 ; 
+	vStream->codec->rc_max_rate = 384000 ; 
+	//vStream->codec->qmin = 4 ;
+	//vStream->codec->qmax = 56;
 	av_dict_set(&opts, "rc_lookahead", "0", 0);
 	av_dict_set(&opts, "quality", "realtime", 0);
 	av_dict_set(&opts, "deadline", "realtime", 0);
-	av_dict_set(&opts, "max-intra-rate", "90", 0);
+	//av_dict_set(&opts, "max-intra-rate", "90", 0);
 	av_dict_set(&opts, "error_resilient", "er", 0);
 	  
 	if (o_fmt_ctx->flags & AVFMT_GLOBALHEADER) 
 		vStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
 	
-	  
 	sprintf(o_fmt_ctx->filename,"rtp://127.0.0.1:5000") ; 
 	
-	int ret_open = avcodec_open2(vStream->codec,o_pCodec,&opts) ;
+	avcodec_open2(vStream->codec,o_pCodec,&opts) ;
 	avio_open(&o_fmt_ctx->pb,o_fmt_ctx->filename, AVIO_FLAG_WRITE) ; 
 	avformat_write_header(o_fmt_ctx, NULL) ;
-	
-	o_pFrame = av_frame_alloc() ;				
-	
+		
 	char sdp[2048] ; 
 	av_sdp_create	(&o_fmt_ctx,1,sdp,2047) ; 
-	JANUS_LOG(LOG_INFO, "[postprocess] sdp : %s\n",sdp);
-	
+	JANUS_LOG(LOG_INFO, "[postprocess] sdp : %s\n",sdp) ;
+   	
    	char * header_buf = g_malloc0(sizeof(char)*16) ; 
 	
+	// scaler 
+	struct SwsContext * resize = NULL ; 			
 	
 	int rtp_written = 0 ; 
 	int sframe_search = 0 ;
@@ -2566,6 +2564,7 @@ static void * janus_videoroom_postprocess(void * data)
 	tmp = g_list_first(userdata->data ) ;
 	janus_mutex_unlock(&userdata->mutex) ;   
 	unsigned long waiting = 0 ; 
+	
 	while(!g_atomic_int_get(&stopping))
 	{
 		janus_mutex_lock(&userdata->mutex) ; 
@@ -2575,16 +2574,16 @@ static void * janus_videoroom_postprocess(void * data)
 		
 		if(!start) // Empty packet list -> wait 
 		{
-			usleep(15000) ; 
+			usleep(2000) ; 
 			waiting++ ; 
 			continue ; 
 		} 
 		
 		if(first_frame && tmp) goto process_frame ; 
 		
-		if(!tmp && (key_search > 20) )
+		if(!tmp && (key_search > 120) )
 		{
-			// send FIR/PLI, need a key frame. 
+			// ask the main thread to send FIR/PLI -> need a key frame. 
 			janus_mutex_lock(&userdata->mutex) ; 
 			userdata->need_keyframe = 1 ; 
 			janus_mutex_unlock(&userdata->mutex) ; 
@@ -2629,8 +2628,8 @@ static void * janus_videoroom_postprocess(void * data)
 		janus_mutex_unlock(&userdata->mutex) ; 
 		continue ; 
 
-	ccontinue :
-
+	ccontinue : 		// useless, just to catch something (stats) with undeleted packets in a previous version of this code 
+		
 		continue ;
 		
 	process_frame : 
@@ -2666,28 +2665,24 @@ static void * janus_videoroom_postprocess(void * data)
 		}
 		if(reset_search_min_seq)
 		{
-			if(tmp)
+			if (ntohs(rtp->seq_number) < cur_seq_number )
 			{
-				if (ntohs(rtp->seq_number) < cur_seq_number )
-				{
-					JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
-					cur_seq_number = ntohs(rtp->seq_number) ;
-				}
-				janus_mutex_lock(&userdata->mutex) ; 
-				tmp = tmp->next ; 
-				janus_mutex_unlock(&userdata->mutex) ; 
-				goto ccontinue ;
+				JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
+				cur_seq_number = ntohs(rtp->seq_number) ;
 			}
-			else // end of min seq number search 
+			janus_mutex_lock(&userdata->mutex) ; 
+			tmp = tmp->next ; 
+			janus_mutex_unlock(&userdata->mutex) ; 
+			if(!tmp) // end of min seq number search 
 			{
-				tmp = start ; 
 				reset_search_min_seq = 0 ;
 				cur_seq_number-- ;  
 				JANUS_LOG(LOG_ERR, "RESET end of min seq search\n") ; 
-				goto ccontinue ;
 			} 
+			goto ccontinue ;			
 		}
 		//// end handle reset
+		
 		if(ntohs(rtp->seq_number) != (cur_seq_number+1))
 		{	  
 			// Packet not folowing 
@@ -2698,18 +2693,16 @@ static void * janus_videoroom_postprocess(void * data)
 			janus_mutex_lock(&userdata->mutex) ; 
 			tmp = tmp->next ;
 			janus_mutex_unlock(&userdata->mutex) ; 
-			if(!tmp)
+			if(!tmp && (nb_search > 100))
 			{
-				if(nb_search > 20) // will arrive too late, skip
-				{
-					JANUS_LOG(LOG_VERB, "[postprocess] packet too late -> skip \n");
-					cur_seq_number++ ;
-					tmp = start ; 
-					frame_len = 0 ; 
-					nb_search = 0 ;
-					was_key_frame = 0 ;  
-					goto ccontinue ; 
-				}
+			// will arrive too late, skip
+				JANUS_LOG(LOG_VERB, "[postprocess] packet too late -> skip \n");
+				cur_seq_number++ ;
+				tmp = start ; 
+				frame_len = 0 ; 
+				nb_search = 0 ;
+				was_key_frame = 0 ;  
+				goto ccontinue ; 
 			}
 			goto ccontinue ; 
 		}
@@ -2750,7 +2743,7 @@ static void * janus_videoroom_postprocess(void * data)
 				vp8h  = infos->vp8h ;
 				vp8hs = infos->vp8hs ;	
 				reinit_decoder = 1 ; 
-				JANUS_LOG(LOG_ERR, "resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
+				JANUS_LOG(LOG_INFO, "resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
 			}
 			
 			memcpy(received_frame+frame_len,infos->offset,infos->len) ; 
@@ -2798,14 +2791,19 @@ static void * janus_videoroom_postprocess(void * data)
 				m_pCodecCtx->pix_fmt = AV_PIX_FMT_YUV420P ;
 				m_pCodecCtx->flags |= CODEC_FLAG_GLOBAL_HEADER ;
 				
-				int res = avcodec_open2(m_pCodecCtx,m_pCodec,0) ;
-				m_pFrame = av_frame_alloc()	;
+				avcodec_open2(m_pCodecCtx,m_pCodec,0) ;
+				if(!m_pFrame)
+					m_pFrame = av_frame_alloc()	;
+				if(!sws_frame)
+					sws_frame = av_frame_alloc() ;
+					 
+				resize = sws_getContext(vp8w,vp8h, AV_PIX_FMT_YUV420P, 800,600, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL) ; 
 				reinit_decoder = 0 ; 
 			}
 			
 			int framefinished = 0 ;
 			int nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&vpacket) ;
-
+			av_free_packet(&vpacket) ; 
 	check_decode_process : 
 	
 			if(nres < 0 )
@@ -2833,6 +2831,7 @@ static void * janus_videoroom_postprocess(void * data)
 				packet.data = NULL ;
 				packet.size = 0 ;
 				nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&packet) ;	
+				av_free_packet(&packet) ; 
 				goto check_decode_process ; 
 			}
 			
@@ -2842,89 +2841,47 @@ static void * janus_videoroom_postprocess(void * data)
 				goto delete_and_continue ; 
 			
 			
-			// complete frame decoded -> convertir en RGB24 
-			/*
-			int sizeofFrame = video_dec_ctx->width * video_dec_ctx->height * 3;
-			retFrame = new byte[sizeofFrame];
-
-			//sws?
-			m_decFrame->width = m_frame->width;
-			m_decFrame->height = m_frame->height;
-			m_decFrame->format = PIX_FMT_BGR24;
-			m_decFrame->channels = 3;
-			m_decFrame->pict_type = m_frame->pict_type;
-			if(m_decFrame->data && m_decFrame->data[0] == NULL && m_decFrame->linesize && m_decFrame->linesize[0] != sizeofFrame)
-			{
-			   m_decFrame->data[0] = new byte[sizeofFrame];
-			   memset(m_decFrame->data[0],0,sizeofFrame);
-			   m_decFrame->linesize[0] = m_decFrame->width *3; //why 3?
-			}
-
-			int swTest = 0 ;
-			SwsContext* modifContext;
-			modifContext = sws_getContext(m_frame->width,
-			   m_frame->height,
-			   (enum AVPixelFormat) m_frame->format,
-			   m_decFrame->width,
-			   m_decFrame->height,
-			   PIX_FMT_BGR24,//OpenCV compatible format
-			   SWS_BICUBIC,
-			   NULL, NULL, NULL);
-
-			swTest = sws_scale(modifContext,
-			   m_frame->data,//input FFMpeg
-			   m_frame->linesize,
-			   0,
-			   m_frame->height,//output BGR24
-			   m_decFrame->data,
-			   m_decFrame->linesize);
-			ret = av_image_copy_to_buffer(retFrame, sizeofFrame, (const uint8_t * const*)(m_decFrame->data), m_decFrame->linesize, PIX_FMT_BGR24, video_dec_ctx->width, video_dec_ctx->height, 1);
-			*/
+			// complete frame decoded -> rescale 
+						 
+			avpicture_fill((AVPicture*) sws_frame, compFrame, AV_PIX_FMT_YUV420P, 800, 600) ;
+			sws_frame->format = AV_PIX_FMT_YUV420P ; 
+			sws_frame->height = 600 ; 
+			sws_frame->width = 800 ; 
+			sws_scale(resize, (const uint8_t *const *)(m_pFrame->data), m_pFrame->linesize, 0, vp8h, sws_frame->data, sws_frame->linesize) ;
 			
-			// HERE YOU HAVE YOUR RAW FRAME, we encode it. 
+			// HERE YOU HAVE YOUR RAW FRAME,  
+			// If you need it in another format like RGB24, scale it first to RGB, then rescale it to YUV420P
 			
+			// ... here make your frame manipulation, opencv ...  
 			
+			// we encode it ...
 			complete_frame++ ; 
 			AVPacket opacket ;
 			av_init_packet(&opacket) ;
-			//av_init_packet(&opacket) ;
 			int decode_finished = 0,enc_finished = 0 ; 
+			if (o_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) vStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
 			
-			if((vp8w  == 640) && (vp8h  == 480))
-			{	
-				if (o_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) vStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
-				
-				
-				av_free_packet(&opacket) ; // weired but without that, encode_video bug/crash ! 
-				
-				decode_finished = avcodec_encode_video2(vStream->codec,&opacket,m_pFrame,&enc_finished) ; 
-				opacket.stream_index = 0 ; 
-				//JANUS_LOG(LOG_ERR, "Encoded !!! \n");
+			
+			av_free_packet(&opacket) ; // weired but without that, encode_video bug/crash ! 
+			
+			decode_finished = avcodec_encode_video2(vStream->codec,&opacket,sws_frame,&enc_finished) ; 
+			opacket.stream_index = 0 ; 
 
-				if(enc_finished)
-				{
-					//JANUS_LOG(LOG_ERR, "Encoding finished !!! \n") ;
-					/* write the compressed frame in the media file ->RTP  */
-					opacket.dts = opacket.pts = AV_NOPTS_VALUE ; 
-					if(vStream->codec->coded_frame->key_frame) opacket.flags |= AV_PKT_FLAG_KEY;
-					int write_ret = av_write_frame(o_fmt_ctx, &opacket);
-					if (write_ret < 0) 
-						JANUS_LOG(LOG_ERR,"Error writing frame to RTP\n") ;
-					else
-					{
-						rtp_written += opacket.size ;
-						
-						/*
-						if((complete_frame%20) == 0 )
-						{
-							JANUS_LOG(LOG_ERR,"\nframe complete           %d             written : %d      cur_seq %d!!!!\n",complete_frame,rtp_written,cur_seq_number) ;
-						}
-						*/
-					}
-				}
-				else if(decode_finished < 0 )
-					JANUS_LOG(LOG_ERR, "[postprocess] ENCoder BROKEN ->> !!! \n");		
+			if(enc_finished)
+			{
+				/* write the compressed frame in the media file ->RTP  */
+				opacket.dts = opacket.pts = AV_NOPTS_VALUE ; 
+				//	if(vStream->codec->coded_frame->key_frame) opacket.flags |= AV_PKT_FLAG_KEY; -> deprecated 
+				int write_ret = av_write_frame(o_fmt_ctx, &opacket);
+				if (write_ret < 0) 
+					JANUS_LOG(LOG_ERR,"Error writing frame to RTP\n") ;
+				else
+					rtp_written += opacket.size ;			
 			}
+			else if(decode_finished < 0 )
+				JANUS_LOG(LOG_ERR, "[postprocess] ENCoder BROKEN ->> !!! \n");		
+			av_free_packet(&opacket) ;
+		
 			frame_len = 0 ; 			
 			goto delete_and_continue ; 
 		}		 
@@ -3629,17 +3586,15 @@ static void *janus_videoroom_handler(void *data) {
 				json_object_set_new(event, "videoroom", json_string("event"));
 				json_object_set_new(event, "room", json_integer(participant->room->room_id));
 				json_object_set_new(event, "postprocessed", json_string("ok"));
-				// Ajouter un publisher à la GhasTable
-				// Lancer un nouveau thread post_process
+				
+				// add the publisher in pp_publishers hashtable and launch a thread 
+				
 				janus_videoroom_incoming_pp * pp_buffer_data = malloc(sizeof(janus_videoroom_incoming_pp)) ; 
 				pp_buffer_data->data = NULL ; 
 				janus_mutex_init(&pp_buffer_data->mutex) ; 
 				pp_buffer_data->participant = participant ; 
 				g_hash_table_insert(pp_publishers,GUINT_TO_POINTER(participant->user_id),pp_buffer_data) ; 
-	
-				GError *error = NULL;
-				JANUS_LOG(LOG_ERR, "Creating postprocess thread\n");
-				
+					
 				pp_thread = g_thread_new("postprocess thread", &janus_videoroom_postprocess,pp_buffer_data) ;
 				
 				
