@@ -298,6 +298,7 @@ typedef struct janus_videoroom_session {
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
 } janus_videoroom_session;
+
 static GHashTable *sessions;
 static GList *old_sessions;
 static janus_mutex sessions_mutex;
@@ -334,7 +335,7 @@ typedef struct janus_videoroom_participant {
 	GHashTable *rtp_forwarders;
 	janus_mutex rtp_forwarders_mutex;
 	int udp_sock; /* The udp socket on which to forward rtp packets */
-} janus_videoroom_participant;
+} janus_videoroom_participant ;
 
 
 // WM add
@@ -373,7 +374,8 @@ typedef struct janus_vp8_infos
 		
 } janus_vp8_infos ; 
 
-GHashTable * pp_publishers ; 
+GHashTable * pp_publishers = NULL; 
+janus_mutex pp_publishers_mutex  ; 
 
 typedef struct janus_pp_rtp_header
 {
@@ -904,6 +906,7 @@ int janus_videoroom_init(janus_callbacks *callback, const char *config_path) {
 		return -1;
 	}
 	pp_publishers = g_hash_table_new(NULL, NULL) ;
+	janus_mutex_init(&pp_publishers_mutex) ; 
 	// WM add
 	JANUS_LOG(LOG_INFO, "%s initialized!\n", JANUS_VIDEOROOM_NAME);
 	return 0;
@@ -1057,7 +1060,7 @@ void janus_videoroom_destroy_session(janus_plugin_session *handle, int *error) {
 						int ret = gateway->push_event(p->session->handle, &janus_videoroom_plugin, NULL, leaving_text, NULL, NULL);
 						JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
 					}
-					g_hash_table_remove(participant->room->participants, GUINT_TO_POINTER(participant->user_id));
+					g_hash_table_remove(participant->room->participants, GUINT_TO_POINTER(participant->user_id)) ;
 					janus_mutex_unlock(&participant->room->participants_mutex);
 				}
 			}
@@ -1989,9 +1992,11 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 			}
 		}
 		janus_mutex_unlock(&participant->rtp_forwarders_mutex);
+		
 		unsigned char * vp8_h = (unsigned char *)(buf+19) ;
 		int need_to_wait = 1 ; 		
-		if (participant->video_active)
+		
+		if (participant->video_active && participant->vrc)
 		{
 			if(participant->vrc->key_frame_received == 0)
 				need_to_wait = 1 ;
@@ -2004,7 +2009,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 			if((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A))
 			{
 				gint64 ts_now = janus_get_monotonic_time() ; 
-				printf("Key Frame !!! Start recording %d now : %"SCNu64" filename : %s\n",participant->vrc->key_frame_received,ts_now,participant->vrc->filename) ;
+				JANUS_LOG(LOG_VERB,"Key Frame !!! Start recording %d now : %"SCNu64" filename : %s\n",participant->vrc->key_frame_received,ts_now,participant->vrc->filename) ;
 				char sz_ts_now[64] ; 
 				sprintf(sz_ts_now,"%"SCNu64"",ts_now) ; 
 				janus_videoroom_insert_timecodedb(participant->vrc->filename,sz_ts_now) ; 
@@ -2017,7 +2022,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 		if(need_to_wait == 0)
 		{
 			if(video && participant->vrc)
-				janus_recorder_save_frame(participant->vrc, buf, len);
+				janus_recorder_save_frame(participant->vrc, buf, len) ;
 			else if(!video && participant->arc)
 			{
 				if(participant->arc->first_sound_frame == 0)
@@ -2031,10 +2036,12 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 				janus_recorder_save_frame(participant->arc, buf, len);
 			}
 		}
+		
 		//WM add
 		/* Done, now feed the post_process thread datalist if needed */ 
 		if(video) // user is in the list -> insert packet in his Glist. 
 		{
+			janus_mutex_lock(&pp_publishers_mutex) ; 
 			janus_videoroom_incoming_pp * entry = g_hash_table_lookup(pp_publishers,GUINT_TO_POINTER(participant->user_id)) ; 
 			if(entry)
 			{
@@ -2044,7 +2051,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 					
 				if(entry->need_keyframe  &&  !((vp8_h[0] == 0x9D) && (vp8_h[1] == 0x01) && (vp8_h[2] == 0x2A)))
 				{
-					JANUS_LOG(LOG_ERR, "Sending FIR/PLI for post process\n");
+					JANUS_LOG(LOG_VERB, "Sending FIR/PLI for post process\n");
 				
 					char rtcpbuf[24];
 					memset(rtcpbuf, 0, 24);
@@ -2061,17 +2068,18 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 				else
 				{
 					//JANUS_LOG(LOG_ERR, "Adding packet to GList of %"SCNu64"\n",participant->user_id);
-					
 					janus_videoroom_rtp_packet * rtp_packet = g_malloc0(sizeof(janus_videoroom_rtp_packet)) ; 
 					rtp_packet->len = len ; 
 					rtp_packet->data = g_malloc0(len) ; 
 					memcpy(rtp_packet->data,buf,len) ; 
 					entry->data = g_list_append(entry->data,rtp_packet) ; 
-					// Fixme g_list_append parcours le tableau entier pour ajouter à la fin, stocker qq part le dernier élément pour éviter de balayer la liste à chaque packet.		 
+					// Fixme g_list_append will enumerate all member of the list in order to add the item at the end -> we should save the last item somewhere and use 
+					// the g_list_insert instead of append. 		 
 				}
 				janus_mutex_unlock(&entry->mutex) ; 
 				
 			}
+			janus_mutex_unlock(&pp_publishers_mutex) ; 
 		}
 		
 		
@@ -2388,10 +2396,6 @@ void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 		infos->xbit = 0 ; 
 		infos->sbit = 0 ; 
 		
-		int vp8w  = 0 ;
-		int vp8ws = 0 ;
-		int vp8h  = 0 ;
-		int vp8hs = 0 ;
 		uint8_t vp8pd = * buf_ptr ;
 		
 		len-- ;
@@ -2451,12 +2455,11 @@ void janus_videoroom_get_vp8info(char * offset,int len,janus_vp8_infos * infos)
 						JANUS_LOG(LOG_WARN, "First 3-bytes after header not what they're supposed to be?\n");
 					else 
 					{
-						vp8w = infos->vp8w = swap2(*(unsigned short*)(c+3))&0x3fff ;
-						vp8ws = infos->vp8ws = swap2(*(unsigned short*)(c+3))>>14 ;
-						vp8h = infos->vp8h = swap2(*(unsigned short*)(c+5))&0x3fff ;
-						vp8hs = infos->vp8hs = swap2(*(unsigned short*)(c+5))>>14 ;
+						infos->vp8w = swap2(*(unsigned short*)(c+3))&0x3fff ;
+						infos->vp8ws = swap2(*(unsigned short*)(c+3))>>14 ;
+						infos->vp8h = swap2(*(unsigned short*)(c+5))&0x3fff ;
+						infos->vp8hs = swap2(*(unsigned short*)(c+5))>>14 ;
 						infos->key = 1 ; 
-						JANUS_LOG(LOG_VERB, "Key frame: %dx%d (scale=%dx%d)\n", vp8w, vp8h, vp8ws, vp8hs) ;
 					}
 				}
 			}
@@ -2528,15 +2531,16 @@ static void * janus_videoroom_postprocess(void * data)
 	vStream->codec->bit_rate = 256000 ; 
 	vStream->codec->slices       = 8;
 	//vStream->codec->profile      = 3 ;
-	vStream->codec->thread_count = 3 ;
+	vStream->codec->thread_count = 1 ;
 	vStream->codec->keyint_min   = 100 ;
 	vStream->codec->rc_min_rate = 128000 ; 
 	vStream->codec->rc_max_rate = 384000 ; 
 	//vStream->codec->qmin = 4 ;
 	//vStream->codec->qmax = 56;
-	av_dict_set(&opts, "rc_lookahead", "0", 0);
-	av_dict_set(&opts, "quality", "realtime", 0);
-	av_dict_set(&opts, "deadline", "realtime", 0);
+	av_dict_set(&opts, "sync_lookahead", "0", 0) ;
+	av_dict_set(&opts, "rc_lookahead", "0", 0) ;
+	av_dict_set(&opts, "quality", "realtime", 0) ;
+	av_dict_set(&opts, "deadline", "realtime", 0) ;
 	//av_dict_set(&opts, "max-intra-rate", "90", 0);
 	av_dict_set(&opts, "error_resilient", "er", 0);
 	  
@@ -2553,7 +2557,7 @@ static void * janus_videoroom_postprocess(void * data)
 	av_sdp_create	(&o_fmt_ctx,1,sdp,2047) ; 
 	JANUS_LOG(LOG_INFO, "[postprocess] sdp : %s\n",sdp) ;
    	
-   	char * header_buf = g_malloc0(sizeof(char)*16) ; 
+   	char header_buf[16] ; 
 	
 	// scaler 
 	struct SwsContext * resize = NULL ; 			
@@ -2564,8 +2568,9 @@ static void * janus_videoroom_postprocess(void * data)
 	tmp = g_list_first(userdata->data ) ;
 	janus_mutex_unlock(&userdata->mutex) ;   
 	unsigned long waiting = 0 ; 
+	int alive = 1 ; 
 	
-	while(!g_atomic_int_get(&stopping))
+	while(!g_atomic_int_get(&stopping) && alive)
 	{
 		janus_mutex_lock(&userdata->mutex) ; 
 		start = g_list_first(userdata->data ) ;
@@ -2575,6 +2580,15 @@ static void * janus_videoroom_postprocess(void * data)
 		if(!start) // Empty packet list -> wait 
 		{
 			usleep(2000) ; 
+			janus_mutex_lock(&pp_publishers_mutex) ; 
+			if(!g_hash_table_lookup(userdata->participant->room->participants, GUINT_TO_POINTER(userdata->participant->user_id)))
+				g_hash_table_remove(pp_publishers, GUINT_TO_POINTER(userdata->participant->user_id)) ;		
+			if(!g_hash_table_lookup(pp_publishers, GUINT_TO_POINTER(userdata->participant->user_id)))
+			{
+				g_hash_table_remove(pp_publishers, GUINT_TO_POINTER(userdata->participant->user_id)) ;
+				alive = 0 ; 
+			}
+			janus_mutex_unlock(&pp_publishers_mutex) ;
 			waiting++ ; 
 			continue ; 
 		} 
@@ -2589,7 +2603,7 @@ static void * janus_videoroom_postprocess(void * data)
 			janus_mutex_unlock(&userdata->mutex) ; 
 			key_search = 0 ; 
 			usleep(25000) ; 
-			JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
+			//JANUS_LOG(LOG_ERR, "Waiting for the first key frame !!! \n");
 		}
 		
 		if (tmp) 
@@ -2634,6 +2648,7 @@ static void * janus_videoroom_postprocess(void * data)
 		
 	process_frame : 
 		; // label followed by declaration, not a statement so it wont compile without that empty statement. 
+		
 		janus_videoroom_rtp_packet * rtp_packet = (janus_videoroom_rtp_packet * ) tmp->data ; 		
 		int skip = 0 ; 
 		memcpy(header_buf,rtp_packet->data,16) ;  
@@ -2658,7 +2673,7 @@ static void * janus_videoroom_postprocess(void * data)
 		if (((cur_seq_number - ntohs(rtp->seq_number) > 10000)) && tmp)
 		{
 			//reset
-			JANUS_LOG(LOG_ERR, "RESET in RTP seq_number current : %"SCNu32" packet %"SCNu16"\n",cur_seq_number,ntohs(rtp->seq_number) );
+			//JANUS_LOG(LOG_ERR, "RESET in RTP seq_number current : %"SCNu32" packet %"SCNu16"\n",cur_seq_number,ntohs(rtp->seq_number) );
 			reset_search_min_seq = 1 ; 
 			cur_seq_number = ntohs(rtp->seq_number) ; 
 			goto ccontinue ; 		
@@ -2667,7 +2682,7 @@ static void * janus_videoroom_postprocess(void * data)
 		{
 			if (ntohs(rtp->seq_number) < cur_seq_number )
 			{
-				JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
+				//JANUS_LOG(LOG_ERR, "RESET min seq found  %"SCNu16"\n",ntohs(rtp->seq_number));
 				cur_seq_number = ntohs(rtp->seq_number) ;
 			}
 			janus_mutex_lock(&userdata->mutex) ; 
@@ -2677,7 +2692,7 @@ static void * janus_videoroom_postprocess(void * data)
 			{
 				reset_search_min_seq = 0 ;
 				cur_seq_number-- ;  
-				JANUS_LOG(LOG_ERR, "RESET end of min seq search\n") ; 
+				//JANUS_LOG(LOG_ERR, "RESET end of min seq search\n") ; 
 			} 
 			goto ccontinue ;			
 		}
@@ -2743,7 +2758,7 @@ static void * janus_videoroom_postprocess(void * data)
 				vp8h  = infos->vp8h ;
 				vp8hs = infos->vp8hs ;	
 				reinit_decoder = 1 ; 
-				JANUS_LOG(LOG_INFO, "resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
+				JANUS_LOG(LOG_VERB, "[POSTPROCESS] resolution has changed !!!!!!!!! %d %d\n",vp8w,vp8h);			
 			}
 			
 			memcpy(received_frame+frame_len,infos->offset,infos->len) ; 
@@ -2774,7 +2789,8 @@ static void * janus_videoroom_postprocess(void * data)
 			{
 				// i'm not sure that is needed. Maybe with older version of libav. 
 				// As the resolution change trigger a keyframe, the decoder should work. 
-	
+				// the scaler need the original resolution too line 2817
+				
 				m_pCodec = avcodec_find_decoder(AV_CODEC_ID_VP8) ;	
 				m_pCodecCtx = avcodec_alloc_context3(m_pCodec) ;
 				m_pCodecCtx->codec_id = AV_CODEC_ID_VP8;
@@ -2804,6 +2820,7 @@ static void * janus_videoroom_postprocess(void * data)
 			int framefinished = 0 ;
 			int nres = avcodec_decode_video2(m_pCodecCtx,m_pFrame,&framefinished,&vpacket) ;
 			av_free_packet(&vpacket) ; 
+			
 	check_decode_process : 
 	
 			if(nres < 0 )
@@ -2855,6 +2872,7 @@ static void * janus_videoroom_postprocess(void * data)
 			// ... here make your frame manipulation, opencv ...  
 			
 			// we encode it ...
+		encode_frame : 
 			complete_frame++ ; 
 			AVPacket opacket ;
 			av_init_packet(&opacket) ;
@@ -2886,8 +2904,17 @@ static void * janus_videoroom_postprocess(void * data)
 			goto delete_and_continue ; 
 		}		 
 	}
+	
+	janus_mutex_lock(&userdata->mutex) ;
+	g_list_free(userdata->data) ; 
+	janus_mutex_unlock(&userdata->mutex) ; 
+	janus_mutex_destroy(&userdata->mutex) ; 
+	g_free(userdata) ; 
+	g_free(compFrame) ;
 	g_free(received_frame) ; 
 	g_free(infos) ; 
+	JANUS_LOG(LOG_INFO, "Leaving POSTPROCESS thread	\n");
+	
 	return NULL ;
 	 
 }
@@ -3574,11 +3601,13 @@ static void *janus_videoroom_handler(void *data) {
 					goto error;
 				}
 				// TODO : add a real error number in the cas already postproceed
-				
-				if(g_hash_table_lookup(pp_publishers,GUINT_TO_POINTER(participant->user_id)) != NULL) {
+				janus_mutex_lock(&pp_publishers_mutex) ; 
+				if(g_hash_table_lookup(pp_publishers,GUINT_TO_POINTER(participant->user_id)) != NULL) 
+				{
 					JANUS_LOG(LOG_ERR, "Can't postprocess, already postprocessed\n");
 					error_code = JANUS_VIDEOROOM_ERROR_NOT_PUBLISHED;
 					g_snprintf(error_cause, 512, "Can't postprocess, already postprocessed");
+					janus_mutex_unlock(&pp_publishers_mutex) ; 
 					goto error;
 				}
 				
@@ -3596,6 +3625,7 @@ static void *janus_videoroom_handler(void *data) {
 				g_hash_table_insert(pp_publishers,GUINT_TO_POINTER(participant->user_id),pp_buffer_data) ; 
 					
 				pp_thread = g_thread_new("postprocess thread", &janus_videoroom_postprocess,pp_buffer_data) ;
+				janus_mutex_unlock(&pp_publishers_mutex) ; 
 				
 				
 			} else if(!strcasecmp(request_text, "leave")) {
